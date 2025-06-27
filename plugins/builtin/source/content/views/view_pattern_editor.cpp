@@ -2792,8 +2792,16 @@ namespace hex::plugin::builtin {
                 }
             },
             [this, path, provider] {
-                // User chose to keep internal changes - update the external file timestamp to prevent further prompts
-                trackExternalFile(path, provider);
+                // User chose to keep internal changes - only update the external file timestamp
+                auto &externalFile = m_externalPatternFile.get(provider);
+                if (externalFile.has_value()) {
+                    try {
+                        // Only update the lastModified timestamp, keep contentHash and originalContent as-is
+                        externalFile->lastModified = std::filesystem::last_write_time(path);
+                    } catch (const std::filesystem::filesystem_error &) {
+                        // Handle filesystem errors gracefully
+                    }
+                }
             }
         );
     }
