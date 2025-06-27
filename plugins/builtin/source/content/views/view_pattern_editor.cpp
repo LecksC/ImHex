@@ -5,6 +5,7 @@
 #include <hex/api/project_file_manager.hpp>
 
 #include <hex/api/events/events_provider.hpp>
+#include <hex/api/events/events_gui.hpp>
 #include <hex/api/events/requests_interaction.hpp>
 
 #include <pl/patterns/pattern.hpp>
@@ -1844,6 +1845,9 @@ namespace hex::plugin::builtin {
             m_textEditor.get(provider).SetText(code, true);
             m_sourceCode.get(provider) = code;
 
+            // Track this as an external file
+            this->trackExternalFile(path, provider);
+
             TaskManager::createBackgroundTask("hex.builtin.task.parsing_pattern", [this, code, provider](auto&) { this->parsePattern(code, provider); });
         }
     }
@@ -2104,6 +2108,17 @@ namespace hex::plugin::builtin {
 
         RequestAddVirtualFile::subscribe(this, [this](const std::fs::path &path, const std::vector<u8> &data, Region region) {
             m_virtualFiles->emplace_back(path, data, region);
+        });
+
+        // Check for external pattern file changes when ImHex gains focus
+        EventWindowFocused::subscribe(this, [this](bool focused) {
+            if (focused) {
+                // Only check when gaining focus, not when losing it
+                auto provider = ImHexApi::Provider::get();
+                if (provider != nullptr) {
+                    checkExternalFileChanges(provider);
+                }
+            }
         });
     }
 
@@ -2665,6 +2680,122 @@ namespace hex::plugin::builtin {
 
             return result;
         });
+    }
+
+    // External pattern file management functions
+    void ViewPatternEditor::trackExternalFile(const std::fs::path &path, prv::Provider *provider) {
+        if (!std::filesystem::exists(path)) {
+            return;
+        }
+
+        try {
+            auto lastModified = std::filesystem::last_write_time(path);
+            auto content = m_textEditor.get(provider).GetText();
+            auto contentHash = calculateContentHash(content);
+
+            ExternalPatternFile fileInfo = {
+                .path = path,
+                .lastModified = lastModified,
+                .contentHash = contentHash,
+                .originalContent = content
+            };
+
+            m_externalPatternFile.get(provider) = fileInfo;
+        } catch (const std::filesystem::filesystem_error &) {
+            // Handle filesystem errors gracefully
+            m_externalPatternFile.get(provider) = std::nullopt;
+        }
+    }
+
+    void ViewPatternEditor::checkExternalFileChanges(prv::Provider *provider) {
+        if (m_checkingExternalFile) {
+            return;  // Prevent recursive checking
+        }
+
+        auto &externalFile = m_externalPatternFile.get(provider);
+        if (!externalFile.has_value()) {
+            return;
+        }
+
+        if (hasExternalFileChanged(*externalFile)) {
+            m_checkingExternalFile = true;
+            
+            try {
+                wolv::io::File file(externalFile->path, wolv::io::File::Mode::Read);
+                if (file.isValid()) {
+                    auto newContent = file.readString();
+                    auto currentContent = m_textEditor.get(provider).GetText();
+                    
+                    // Check if the internal editor has also been modified
+                    bool internalModified = (calculateContentHash(currentContent) != externalFile->contentHash);
+                    
+                    if (internalModified) {
+                        // Show conflict resolution popup
+                        showFileConflictPopup(externalFile->path, provider);
+                    } else {
+                        // No conflict, just reload the file
+                        m_textEditor.get(provider).SetText(newContent, true);
+                        m_sourceCode.get(provider) = newContent;
+                        
+                        // Update tracking info
+                        trackExternalFile(externalFile->path, provider);
+                        
+                        // Parse the new content
+                        TaskManager::createBackgroundTask("hex.builtin.task.parsing_pattern", [this, newContent, provider](auto&) { 
+                            this->parsePattern(newContent, provider); 
+                        });
+                    }
+                }
+            } catch (const std::filesystem::filesystem_error &) {
+                // Handle filesystem errors gracefully
+            }
+            
+            m_checkingExternalFile = false;
+        }
+    }
+
+    bool ViewPatternEditor::hasExternalFileChanged(const ExternalPatternFile &fileInfo) const {
+        try {
+            if (!std::filesystem::exists(fileInfo.path)) {
+                return false;
+            }
+            
+            auto currentModified = std::filesystem::last_write_time(fileInfo.path);
+            return currentModified != fileInfo.lastModified;
+        } catch (const std::filesystem::filesystem_error &) {
+            return false;
+        }
+    }
+
+    size_t ViewPatternEditor::calculateContentHash(const std::string &content) const {
+        return std::hash<std::string>{}(content);
+    }
+
+    void ViewPatternEditor::showFileConflictPopup(const std::fs::path &path, prv::Provider *provider) {
+        ui::PopupQuestion::open(
+            hex::format("The external pattern file '{}' has been modified.\n\nYou also have unsaved changes in the internal editor.\n\nDo you want to reload the file and lose your internal changes?", wolv::util::toUTF8String(path.filename())),
+            [this, path, provider] {
+                // User chose to reload - overwrite internal changes
+                wolv::io::File file(path, wolv::io::File::Mode::Read);
+                if (file.isValid()) {
+                    auto newContent = file.readString();
+                    m_textEditor.get(provider).SetText(newContent, true);
+                    m_sourceCode.get(provider) = newContent;
+                    
+                    // Update tracking info
+                    trackExternalFile(path, provider);
+                    
+                    // Parse the new content
+                    TaskManager::createBackgroundTask("hex.builtin.task.parsing_pattern", [this, newContent, provider](auto&) { 
+                        this->parsePattern(newContent, provider); 
+                    });
+                }
+            },
+            [this, path, provider] {
+                // User chose to keep internal changes - update the external file timestamp to prevent further prompts
+                trackExternalFile(path, provider);
+            }
+        );
     }
 
 }
